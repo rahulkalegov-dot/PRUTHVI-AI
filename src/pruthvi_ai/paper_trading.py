@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -17,42 +17,49 @@ class PaperPosition:
 class PaperTradingEngine:
 
     def __init__(self, capital=10000):
+        if capital <= 0:
+            raise ValueError("Invalid capital")
+
         self.initial_capital = capital
         self.cash = capital
         self.positions = []
         self.trade_history = []
 
     def open_position(
-        self,
-        symbol,
-        side,
-        quantity,
-        entry,
-        stop_loss,
-        target
+        self, symbol, side, quantity,
+        entry, stop_loss, target
     ):
-        if side not in ("BUY", "SELL"):
+        if not symbol or side not in ("BUY", "SELL"):
             return False
 
-        if not symbol or quantity <= 0:
+        if quantity <= 0:
             return False
 
         if min(entry, stop_loss, target) <= 0:
             return False
 
+        if any(
+            p.symbol == symbol and p.status == "OPEN"
+            for p in self.positions
+        ):
+            return False
+
+        if len(self.get_open_positions()) >= 2:
+            return False
+
         if side == "BUY":
             if not stop_loss < entry < target:
                 return False
+
             cost = entry * quantity
+
         else:
             if not target < entry < stop_loss:
                 return False
-            cost = 0
 
-        if side == "BUY" and cost > self.cash:
-            return False
+            cost = entry * quantity
 
-        if len(self.positions) >= 2:
+        if cost > self.cash:
             return False
 
         position = PaperPosition(
@@ -62,7 +69,7 @@ class PaperTradingEngine:
             entry_price=entry,
             stop_loss=stop_loss,
             target=target,
-            entry_time=datetime.now()
+            entry_time=datetime.now(timezone.utc)
         )
 
         self.cash -= cost
@@ -70,30 +77,36 @@ class PaperTradingEngine:
 
         return True
 
+    def get_open_positions(self):
+        return [
+            p for p in self.positions
+            if p.status == "OPEN"
+        ]
+
     def close_position(self, symbol, exit_price):
+        if exit_price <= 0:
+            return False
 
         for position in self.positions:
-
             if position.symbol != symbol:
                 continue
 
             if position.status != "OPEN":
                 continue
 
-            if exit_price <= 0:
-                return False
-
             if position.side == "BUY":
                 pnl = (
                     exit_price - position.entry_price
                 ) * position.quantity
-
-                self.cash += exit_price * position.quantity
-
             else:
                 pnl = (
                     position.entry_price - exit_price
                 ) * position.quantity
+
+            self.cash += (
+                position.entry_price * position.quantity
+                + pnl
+            )
 
             position.status = "CLOSED"
 
