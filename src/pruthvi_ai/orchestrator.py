@@ -1,4 +1,7 @@
+
 from dataclasses import dataclass
+
+from .telegram_reporter import send_telegram_report
 
 
 @dataclass
@@ -29,3 +32,15 @@ class MasterOrchestrator:
             ready_stocks=ready,
             rejected_stocks=rejected
         )
+
+    def send_status_report(self, status):
+        message = (
+            "PRUTHVI AI SYSTEM REPORT\n"
+            f"Status: {status.status}\n"
+            f"Scanned stocks: {status.scanned_stocks}\n"
+            f"Ready stocks: {status.ready_stocks}\n"
+            f"Rejected stocks: {status.rejected_stocks}\n"
+            "Mode: PAPER ONLY"
+        )
+
+        return send_telegram_report(message)
