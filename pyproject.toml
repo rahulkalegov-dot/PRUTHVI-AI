@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pruthvi-ai"
+version = "1.0.0"
+description = "NSE NIFTY 50 AI Paper Trading System"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas",
+    "numpy",
+    "requests",
+    "python-dotenv",
+    "pydantic",
+    "streamlit",
+    "plotly",
+    "sqlalchemy",
+    "psycopg[binary]"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
