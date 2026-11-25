@@ -1,0 +1,42 @@
+"""
+PRUTHVI AI - Central Configuration
+"""
+
+PROJECT_NAME = "PRUTHVI AI"
+VERSION = "1.0.0"
+
+# Exchange
+EXCHANGE = "NSE"
+MARKET_INDEX = "NIFTY 50"
+TIMEZONE = "Asia/Kolkata"
+
+# Market timeframes
+ENTRY_TIMEFRAME = "5m"
+PRIMARY_TIMEFRAME = "15m"
+TREND_TIMEFRAME = "1h"
+
+# Trading safety
+PAPER_ONLY = True
+LIVE_TRADING_ENABLED = False
+AUTO_EXECUTION_ENABLED = False
+
+# Market coverage
+UNIVERSE = "NIFTY 50"
+EXPECTED_STOCK_COUNT = 50
+
+# Applications
+PAPER_TRADING_APP = "MegaBull"
+REPORTING_PLATFORM = "Telegram"
+
+# Risk controls
+RISK_APPROVAL_REQUIRED = True
+STOP_LOSS_REQUIRED = True
+INTRADAY_SQUARE_OFF_REQUIRED = True
+
+# Data safety
+REJECT_STALE_DATA = True
+REJECT_MISSING_DATA = True
+REQUIRE_DATA_TIMESTAMP = True
+
+# Release control
+RELEASE_APPROVED = False
