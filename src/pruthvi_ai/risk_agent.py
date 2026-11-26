@@ -1,4 +1,5 @@
 
+"""Risk gate for virtual trades. Approval is mandatory before paper entry."""
 from dataclasses import dataclass
 from math import isfinite
 
@@ -21,24 +22,41 @@ def approve_trade(
     side="BUY",
     database=None,
     symbol="UNKNOWN",
+    limits=None,
 ):
-    limits = RiskLimits()
+    limits = limits or RiskLimits()
 
     def reject(reason):
         if database is not None:
-            database.save_risk_check(
-                symbol=symbol,
-                approved=False,
-                reason=reason,
-            )
+            database.save_risk_check(symbol, False, reason)
         return False, reason
 
-    values = [capital, entry, stop_loss, daily_loss]
+    try:
+        values = [
+            float(capital),
+            float(entry),
+            float(stop_loss),
+            float(daily_loss),
+        ]
 
-    if not all(isfinite(x) for x in values):
-        return reject("Invalid numeric data")
+        if not all(isfinite(v) for v in values):
+            return reject("Invalid numeric data")
 
-    if min(capital, entry, stop_loss) <= 0:
+        capital, entry, stop_loss, daily_loss = values
+
+        if isinstance(open_positions, bool) or int(open_positions) != open_positions:
+            return reject("Invalid open-position count")
+
+        if isinstance(trades_today, bool) or int(trades_today) != trades_today:
+            return reject("Invalid daily trade count")
+
+        open_positions = int(open_positions)
+        trades_today = int(trades_today)
+
+    except (TypeError, ValueError, OverflowError):
+        return reject("Invalid risk inputs")
+
+    if capital <= 0 or entry <= 0 or stop_loss <= 0:
         return reject("Invalid price or capital")
 
     if open_positions < 0 or trades_today < 0 or daily_loss < 0:
@@ -64,8 +82,7 @@ def approve_trade(
 
     risk_per_share = abs(entry - stop_loss)
     risk_amount = capital * limits.max_risk_per_trade
-
-    quantity = int(risk_amount / risk_per_share)
+    quantity = int(risk_amount // risk_per_share)
 
     if quantity < 1:
         return reject("Insufficient capital for minimum position")
@@ -78,14 +95,12 @@ def approve_trade(
         "quantity": quantity,
         "risk_amount": risk_amount,
         "maximum_loss_per_share": risk_per_share,
+        "maximum_trade_loss": quantity * risk_per_share,
     }
 
     if database is not None:
         database.save_risk_check(
-            symbol=symbol,
-            approved=True,
-            reason="Risk checks passed",
-            details=result,
+            symbol, True, "Risk checks passed", result
         )
 
     return True, result
