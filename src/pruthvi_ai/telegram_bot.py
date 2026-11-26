@@ -31,8 +31,17 @@ def _send_reply(message):
 
 def _get_system_status():
     from .main import run_system_check
-
     return run_system_check()
+
+
+def _get_daily_report():
+    from .daily_report_service import (
+        generate_sqlite_daily_report,
+        format_sqlite_daily_report,
+    )
+
+    report = generate_sqlite_daily_report()
+    return format_sqlite_daily_report(report)
 
 
 def handle_update(update, status_provider=None, report_provider=None):
@@ -44,7 +53,6 @@ def handle_update(update, status_provider=None, report_provider=None):
     chat = message.get("chat", {})
     incoming_chat_id = str(chat.get("id", ""))
 
-    # Accept commands only from the configured Telegram chat.
     if incoming_chat_id != allowed_chat_id:
         return False
 
@@ -96,20 +104,15 @@ def handle_update(update, status_provider=None, report_provider=None):
             reply = "Unable to retrieve system status."
 
     elif command == "/report":
-        if report_provider is None:
-            reply = (
-                "Daily report provider is not connected yet.\n"
-                "Please check the scheduled daily report."
-            )
-        else:
-            try:
-                reply = report_provider()
+        try:
+            provider = report_provider or _get_daily_report
+            reply = provider()
 
-                if not isinstance(reply, str) or not reply.strip():
-                    reply = "No daily report is currently available."
+            if not isinstance(reply, str) or not reply.strip():
+                reply = "No daily report is currently available."
 
-            except Exception:
-                reply = "Unable to retrieve the daily report."
+        except Exception:
+            reply = "Unable to retrieve the daily report. Check database health."
 
     else:
         reply = "Unknown command. Send /help to see available commands."
@@ -154,11 +157,13 @@ def run_telegram_bot():
                 try:
                     handle_update(update)
                 except Exception:
-                    # Continue processing subsequent updates.
                     continue
 
         except requests.HTTPError as error:
-            if error.response is not None and error.response.status_code == 409:
+            if (
+                error.response is not None
+                and error.response.status_code == 409
+            ):
                 raise RuntimeError(
                     "Telegram webhook is active. "
                     "Polling cannot run until the webhook is removed."
