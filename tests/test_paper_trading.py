@@ -1,4 +1,18 @@
+
+import pytest
+
 from pruthvi_ai.paper_trading import PaperTradingEngine
+from pruthvi_ai import database
+
+
+@pytest.fixture(autouse=True)
+def isolate_test_database(tmp_path, monkeypatch):
+    """Give every test a clean, separate SQLite database."""
+    monkeypatch.setattr(
+        database,
+        "DATABASE_PATH",
+        tmp_path / "test_pruthvi_ai.db"
+    )
 
 
 def test_initial_capital():
