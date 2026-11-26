@@ -2,6 +2,10 @@
 from dataclasses import dataclass
 
 from .telegram_reporter import send_telegram_report
+from .report_agent import (
+    generate_daily_report,
+    format_daily_report,
+)
 
 
 @dataclass
@@ -42,5 +46,28 @@ class MasterOrchestrator:
             f"Rejected stocks: {status.rejected_stocks}\n"
             "Mode: PAPER ONLY"
         )
+
+        return send_telegram_report(message)
+
+    def send_daily_report(
+        self,
+        scanned_stocks,
+        decisions,
+        paper_trading_engine,
+        errors=None,
+    ):
+        if paper_trading_engine is None:
+            return False, "Paper trading engine is missing"
+
+        trades = paper_trading_engine.trade_history
+
+        report = generate_daily_report(
+            scanned_stocks=scanned_stocks,
+            decisions=decisions,
+            trades=trades,
+            errors=errors,
+        )
+
+        message = format_daily_report(report)
 
         return send_telegram_report(message)
