@@ -1,9 +1,11 @@
 
+"""Persistent virtual trade simulator. It has no broker or live-order interface."""
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import isfinite
 
 from .database import PRUTHVIDatabase
-
+from .risk_agent import approve_trade
 
 PAPER_ONLY = True
 LIVE_TRADING_ENABLED = False
@@ -24,13 +26,16 @@ class PaperPosition:
 
 
 class PaperTradingEngine:
-
     def __init__(self, capital=10000, database=None):
-        if capital <= 0:
+        if (
+            not isinstance(capital, (int, float))
+            or not isfinite(float(capital))
+            or capital <= 0
+        ):
             raise ValueError("Invalid capital")
 
-        self.initial_capital = capital
-        self.cash = capital
+        self.initial_capital = float(capital)
+        self.cash = float(capital)
         self.positions = []
         self.trade_history = []
         self.database = database or PRUTHVIDatabase()
@@ -39,19 +44,34 @@ class PaperTradingEngine:
         self._restore_from_database()
 
     def _restore_from_database(self):
-        """Restore persisted positions and trade history."""
-
         history = self.database.get_trade_history()
-        open_trades = []
-
         realized_pnl = 0.0
         invested_amount = 0.0
 
         for trade in history:
             if trade["status"] == "OPEN":
-                open_trades.append(trade)
+                entry_time = datetime.fromisoformat(
+                    trade["entry_time"]
+                )
+
+                pos = PaperPosition(
+                    trade["symbol"],
+                    trade["side"],
+                    int(trade["quantity"]),
+                    float(trade["entry_price"]),
+                    float(trade["stop_loss"]),
+                    float(trade["target"]),
+                    entry_time,
+                    "OPEN",
+                )
+
+                self.positions.append(pos)
+                self.trade_ids[pos.symbol] = trade["trade_id"]
+                invested_amount += pos.entry_price * pos.quantity
+
             else:
-                realized_pnl += float(trade["gross_pnl"] or 0)
+                pnl = float(trade["gross_pnl"] or 0)
+                realized_pnl += pnl
 
                 self.trade_history.append({
                     "symbol": trade["symbol"],
@@ -59,30 +79,11 @@ class PaperTradingEngine:
                     "entry": trade["entry_price"],
                     "exit": trade["exit_price"],
                     "quantity": trade["quantity"],
-                    "gross_pnl": trade["gross_pnl"],
-                    "net_pnl": trade["net_pnl"],
+                    "gross_pnl": pnl,
+                    "net_pnl": float(trade["net_pnl"] or pnl),
+                    "entry_time": trade["entry_time"],
+                    "exit_time": trade["exit_time"],
                 })
-
-        for trade in open_trades:
-            position = PaperPosition(
-                symbol=trade["symbol"],
-                side=trade["side"],
-                quantity=trade["quantity"],
-                entry_price=trade["entry_price"],
-                stop_loss=trade["stop_loss"],
-                target=trade["target"],
-                entry_time=datetime.fromisoformat(
-                    trade["entry_time"]
-                ),
-                status="OPEN",
-            )
-
-            self.positions.append(position)
-            self.trade_ids[position.symbol] = trade["trade_id"]
-
-            invested_amount += (
-                position.entry_price * position.quantity
-            )
 
         self.cash = (
             self.initial_capital
@@ -90,87 +91,148 @@ class PaperTradingEngine:
             - invested_amount
         )
 
+    def get_open_positions(self):
+        return [
+            p for p in self.positions
+            if p.status == "OPEN"
+        ]
+
+    def _risk_gate(self, symbol, side, quantity, entry, stop_loss):
+        open_positions = len(self.get_open_positions())
+        history = self.database.get_trade_history()
+
+        # Conservative until reliable session accounting is implemented.
+        trades_count = len(history)
+
+        realized = sum(
+            float(t.get("net_pnl") or 0)
+            for t in history
+            if t["status"] == "CLOSED"
+        )
+
+        daily_loss = max(0.0, -realized)
+
+        approved, result = approve_trade(
+            capital=self.initial_capital,
+            entry=float(entry),
+            stop_loss=float(stop_loss),
+            open_positions=open_positions,
+            trades_today=trades_count,
+            daily_loss=daily_loss,
+            side=side,
+            database=self.database,
+            symbol=symbol,
+        )
+
+        if not approved:
+            return False
+
+        return int(quantity) <= int(result["quantity"])
+
     def open_position(
-        self,
-        symbol,
-        side,
-        quantity,
-        entry,
-        stop_loss,
-        target,
+        self, symbol, side, quantity, entry, stop_loss, target
     ):
-        if not symbol or side not in ("BUY", "SELL"):
-            return False
+        try:
+            if not isinstance(symbol, str) or not symbol.strip():
+                return False
 
-        if quantity <= 0:
-            return False
+            symbol = symbol.strip().upper()
 
-        if min(entry, stop_loss, target) <= 0:
+            if side not in ("BUY", "SELL"):
+                return False
+
+            if (
+                isinstance(quantity, bool)
+                or int(quantity) != quantity
+                or quantity <= 0
+            ):
+                return False
+
+            quantity = int(quantity)
+
+            values = [
+                float(entry),
+                float(stop_loss),
+                float(target),
+            ]
+
+            if not all(isfinite(v) and v > 0 for v in values):
+                return False
+
+            entry, stop_loss, target = values
+
+        except (TypeError, ValueError, OverflowError):
             return False
 
         if any(
-            p.symbol == symbol and p.status == "OPEN"
-            for p in self.positions
+            p.symbol == symbol
+            for p in self.get_open_positions()
         ):
             return False
 
         if len(self.get_open_positions()) >= 2:
             return False
 
-        if side == "BUY":
-            if not stop_loss < entry < target:
-                return False
-        else:
-            if not target < entry < stop_loss:
-                return False
-
-        cost = entry * quantity
-
-        if cost > self.cash:
+        if side == "BUY" and not stop_loss < entry < target:
             return False
 
-        # Save to persistent storage before changing engine state.
+        if side == "SELL" and not target < entry < stop_loss:
+            return False
+
+        # Mandatory Risk Agent approval occurs inside the engine.
+        if not self._risk_gate(
+            symbol, side, quantity, entry, stop_loss
+        ):
+            return False
+
+        reserved = entry * quantity
+
+        if reserved > self.cash:
+            self.database.save_risk_check(
+                symbol, False, "Insufficient available paper cash"
+            )
+            return False
+
         trade_id = self.database.record_trade_open(
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            entry_price=entry,
-            stop_loss=stop_loss,
-            target=target,
+            symbol,
+            side,
+            quantity,
+            entry,
+            stop_loss,
+            target,
         )
 
         position = PaperPosition(
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            entry_price=entry,
-            stop_loss=stop_loss,
-            target=target,
-            entry_time=datetime.now(timezone.utc),
+            symbol,
+            side,
+            quantity,
+            entry,
+            stop_loss,
+            target,
+            datetime.now(timezone.utc),
         )
 
-        self.cash -= cost
+        self.cash -= reserved
         self.positions.append(position)
         self.trade_ids[symbol] = trade_id
 
         return True
 
-    def get_open_positions(self):
-        return [
-            position
-            for position in self.positions
-            if position.status == "OPEN"
-        ]
-
     def close_position(self, symbol, exit_price):
-        if exit_price <= 0:
+        try:
+            exit_price = float(exit_price)
+
+            if not isfinite(exit_price) or exit_price <= 0:
+                return False
+
+        except (TypeError, ValueError):
             return False
 
         for position in self.positions:
-            if position.symbol != symbol:
-                continue
-
-            if position.status != "OPEN":
+            if (
+                position.symbol != symbol
+                or position.status != "OPEN"
+            ):
                 continue
 
             if position.side == "BUY":
@@ -187,16 +249,13 @@ class PaperTradingEngine:
             if not trade_id:
                 return False
 
-            # Persist the exit before updating engine state.
             self.database.record_trade_close(
-                trade_id=trade_id,
-                exit_price=exit_price,
-                gross_pnl=pnl,
-                net_pnl=pnl,
+                trade_id, exit_price, pnl, pnl
             )
 
             self.cash += (
-                position.entry_price * position.quantity + pnl
+                position.entry_price * position.quantity
+                + pnl
             )
 
             position.status = "CLOSED"
@@ -209,6 +268,8 @@ class PaperTradingEngine:
                 "quantity": position.quantity,
                 "gross_pnl": pnl,
                 "net_pnl": pnl,
+                "entry_time": position.entry_time.isoformat(),
+                "exit_time": datetime.now(timezone.utc).isoformat(),
             })
 
             self.trade_ids.pop(symbol, None)
@@ -219,6 +280,6 @@ class PaperTradingEngine:
 
     def get_realized_pnl(self):
         return sum(
-            trade["gross_pnl"]
-            for trade in self.trade_history
+            float(t["gross_pnl"])
+            for t in self.trade_history
         )
