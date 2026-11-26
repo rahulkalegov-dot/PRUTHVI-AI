@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass
 from math import isfinite
 
@@ -17,38 +18,49 @@ def approve_trade(
     open_positions=0,
     trades_today=0,
     daily_loss=0,
-    side="BUY"
+    side="BUY",
+    database=None,
+    symbol="UNKNOWN",
 ):
     limits = RiskLimits()
+
+    def reject(reason):
+        if database is not None:
+            database.save_risk_check(
+                symbol=symbol,
+                approved=False,
+                reason=reason,
+            )
+        return False, reason
 
     values = [capital, entry, stop_loss, daily_loss]
 
     if not all(isfinite(x) for x in values):
-        return False, "Invalid numeric data"
+        return reject("Invalid numeric data")
 
     if min(capital, entry, stop_loss) <= 0:
-        return False, "Invalid price or capital"
+        return reject("Invalid price or capital")
 
     if open_positions < 0 or trades_today < 0 or daily_loss < 0:
-        return False, "Invalid risk inputs"
+        return reject("Invalid risk inputs")
 
     if side not in ("BUY", "SELL"):
-        return False, "Invalid trade side"
+        return reject("Invalid trade side")
 
     if side == "BUY" and stop_loss >= entry:
-        return False, "Invalid BUY stop-loss"
+        return reject("Invalid BUY stop-loss")
 
     if side == "SELL" and stop_loss <= entry:
-        return False, "Invalid SELL stop-loss"
+        return reject("Invalid SELL stop-loss")
 
     if open_positions >= limits.max_positions:
-        return False, "Maximum positions reached"
+        return reject("Maximum positions reached")
 
     if trades_today >= limits.max_trades_per_day:
-        return False, "Daily trade limit reached"
+        return reject("Daily trade limit reached")
 
     if daily_loss >= capital * limits.max_daily_loss:
-        return False, "Daily loss limit reached"
+        return reject("Daily loss limit reached")
 
     risk_per_share = abs(entry - stop_loss)
     risk_amount = capital * limits.max_risk_per_trade
@@ -56,14 +68,24 @@ def approve_trade(
     quantity = int(risk_amount / risk_per_share)
 
     if quantity < 1:
-        return False, "Insufficient capital for minimum position"
+        return reject("Insufficient capital for minimum position")
 
     if quantity * entry > capital:
-        return False, "Insufficient capital for position exposure"
+        return reject("Insufficient capital for position exposure")
 
-    return True, {
+    result = {
         "side": side,
         "quantity": quantity,
         "risk_amount": risk_amount,
-        "maximum_loss_per_share": risk_per_share
+        "maximum_loss_per_share": risk_per_share,
     }
+
+    if database is not None:
+        database.save_risk_check(
+            symbol=symbol,
+            approved=True,
+            reason="Risk checks passed",
+            details=result,
+        )
+
+    return True, result
