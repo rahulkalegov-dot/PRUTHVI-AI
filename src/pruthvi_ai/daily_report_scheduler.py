@@ -1,13 +1,13 @@
 
-"""Persistent daily Telegram report scheduler with SQLite failure auditing.
-
-PAPER ONLY. No broker orders or trade execution.
+"""Persistent daily Telegram report scheduler.
 Weekdays at 15:35 Asia/Kolkata.
+PAPER ONLY. No broker orders or trade execution.
 """
 
 import logging
 import threading
 import time
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class DailyReportScheduler:
+
     def __init__(
         self,
         report_provider=None,
@@ -49,9 +50,7 @@ class DailyReportScheduler:
         return PRUTHVIDatabase(self.db_path)
 
     def _initialize_delivery_table(self):
-        db = self._database()
-
-        with db.connect() as conn:
+        with self._database().connect() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS daily_report_deliveries (
                     report_date TEXT PRIMARY KEY,
@@ -63,35 +62,28 @@ class DailyReportScheduler:
             """)
 
     def _generate_report(self):
-        report = generate_sqlite_daily_report(db_path=self.db_path)
+        report = generate_sqlite_daily_report(
+            db_path=self.db_path
+        )
         return format_sqlite_daily_report(report)
 
     def _claim_report_date(self, report_date):
-        """Atomically claim the date to prevent duplicate reports."""
-        db = self._database()
+        """Atomically claim a report date."""
         date_key = report_date.isoformat()
+        db = self._database()
 
         with db.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-
-            old_record = conn.execute("""
-                SELECT 1
-                FROM audit_logs
-                WHERE event_type = 'DAILY_REPORT_SENT'
-                  AND json_extract(details, '$.report_date') = ?
-                LIMIT 1
-            """, (date_key,)).fetchone()
-
-            if old_record:
-                return False
-
-            inserted = conn.execute("""
-                INSERT OR IGNORE INTO daily_report_deliveries
+            result = conn.execute("""
+                INSERT INTO daily_report_deliveries
                     (report_date, status, attempted_at)
                 VALUES (?, 'SENDING', ?)
-            """, (date_key, datetime.now(IST).isoformat()))
+                ON CONFLICT(report_date) DO NOTHING
+            """, (
+                date_key,
+                datetime.now(IST).isoformat(),
+            ))
 
-            return inserted.rowcount == 1
+            return result.rowcount == 1
 
     def _mark_sent(self, report_date):
         db = self._database()
@@ -99,8 +91,10 @@ class DailyReportScheduler:
         with db.connect() as conn:
             conn.execute("""
                 UPDATE daily_report_deliveries
-                SET status = 'SENT', sent_at = ?
-                WHERE report_date = ? AND status = 'SENDING'
+                SET status = 'SENT',
+                    sent_at = ?
+                WHERE report_date = ?
+                  AND status = 'SENDING'
             """, (
                 datetime.now(IST).isoformat(),
                 report_date.isoformat(),
@@ -119,14 +113,12 @@ class DailyReportScheduler:
         error,
         exception_type=None,
     ):
-        """Persist a structured scheduler failure in SQLite."""
         details = {
             "component": "daily_report_scheduler",
             "report_date": report_date.isoformat(),
             "failure_stage": str(stage),
             "exception_type": (
-                exception_type
-                or type(error).__name__
+                exception_type or type(error).__name__
             ),
             "error": str(error),
             "paper_only": True,
@@ -139,7 +131,7 @@ class DailyReportScheduler:
         )
 
     def run_once(self, now=None):
-        """Run one scheduled attempt and audit failures."""
+        """Run one scheduled report attempt."""
         current = now or datetime.now(IST)
 
         if current.tzinfo is None:
@@ -189,6 +181,7 @@ class DailyReportScheduler:
 
                 stage = "mark_sent"
                 self._mark_sent(report_date)
+
                 return True
 
             except Exception as error:
@@ -205,7 +198,7 @@ class DailyReportScheduler:
                     )
                 except Exception:
                     logger.exception(
-                        "Could not save scheduler failure to SQLite"
+                        "Could not save scheduler failure"
                     )
 
                 return False
@@ -215,6 +208,7 @@ class DailyReportScheduler:
             return
 
         self._stop_event.clear()
+
         self._thread = threading.Thread(
             target=self._run,
             name="pruthvi-daily-report-scheduler",
@@ -233,8 +227,9 @@ class DailyReportScheduler:
             try:
                 self.run_once()
             except Exception:
-                # Last-resort protection: keep the worker alive.
-                logger.exception("Unexpected scheduler loop failure")
+                logger.exception(
+                    "Unexpected scheduler loop failure"
+                )
 
             self._stop_event.wait(self.poll_interval)
 
