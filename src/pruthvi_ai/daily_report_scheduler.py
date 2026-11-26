@@ -1,7 +1,7 @@
 
-"""Persistent duplicate-safe daily Telegram report scheduler.
+"""Persistent daily Telegram report scheduler with SQLite failure auditing.
 
-Paper-trading reporting only. No broker orders or trade execution.
+PAPER ONLY. No broker orders or trade execution.
 Weekdays at 15:35 Asia/Kolkata.
 """
 
@@ -49,7 +49,6 @@ class DailyReportScheduler:
         return PRUTHVIDatabase(self.db_path)
 
     def _initialize_delivery_table(self):
-        """Create a persistent table with one row per report date."""
         db = self._database()
 
         with db.connect() as conn:
@@ -64,20 +63,17 @@ class DailyReportScheduler:
             """)
 
     def _generate_report(self):
-        report = generate_sqlite_daily_report(
-            db_path=self.db_path
-        )
+        report = generate_sqlite_daily_report(db_path=self.db_path)
         return format_sqlite_daily_report(report)
 
     def _claim_report_date(self, report_date):
-        """Atomically claim a date so another worker cannot send it."""
+        """Atomically claim the date to prevent duplicate reports."""
         db = self._database()
         date_key = report_date.isoformat()
 
         with db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
 
-            # Respect successful reports recorded by the older scheduler.
             old_record = conn.execute("""
                 SELECT 1
                 FROM audit_logs
@@ -95,17 +91,7 @@ class DailyReportScheduler:
                 VALUES (?, 'SENDING', ?)
             """, (date_key, datetime.now(IST).isoformat()))
 
-            if inserted.rowcount == 1:
-                return True
-
-            existing = conn.execute("""
-                SELECT status
-                FROM daily_report_deliveries
-                WHERE report_date = ?
-            """, (date_key,)).fetchone()
-
-            # SENT and SENDING both block another automatic send.
-            return False
+            return inserted.rowcount == 1
 
     def _mark_sent(self, report_date):
         db = self._database()
@@ -113,10 +99,8 @@ class DailyReportScheduler:
         with db.connect() as conn:
             conn.execute("""
                 UPDATE daily_report_deliveries
-                SET status = 'SENT',
-                    sent_at = ?
-                WHERE report_date = ?
-                  AND status = 'SENDING'
+                SET status = 'SENT', sent_at = ?
+                WHERE report_date = ? AND status = 'SENDING'
             """, (
                 datetime.now(IST).isoformat(),
                 report_date.isoformat(),
@@ -128,15 +112,34 @@ class DailyReportScheduler:
             {"report_date": report_date.isoformat()},
         )
 
-    def _record_error(self, report_date, error):
+    def _record_failure(
+        self,
+        report_date,
+        stage,
+        error,
+        exception_type=None,
+    ):
+        """Persist a structured scheduler failure in SQLite."""
+        details = {
+            "component": "daily_report_scheduler",
+            "report_date": report_date.isoformat(),
+            "failure_stage": str(stage),
+            "exception_type": (
+                exception_type
+                or type(error).__name__
+            ),
+            "error": str(error),
+            "paper_only": True,
+        }
+
         self._database().log_event(
-            "DAILY_REPORT_ERROR",
-            str(error),
-            {"report_date": report_date.isoformat()},
+            "DAILY_REPORT_SCHEDULER_ERROR",
+            f"Daily report scheduler failed during {stage}: {error}",
+            details,
         )
 
     def run_once(self, now=None):
-        """Send today's report once after the scheduled time."""
+        """Run one scheduled attempt and audit failures."""
         current = now or datetime.now(IST)
 
         if current.tzinfo is None:
@@ -160,39 +163,51 @@ class DailyReportScheduler:
         report_date = current.date()
 
         with self._lock:
+            stage = "claim"
+
             try:
                 if not self._claim_report_date(report_date):
                     return False
 
+                stage = "report_generation"
                 message = self.report_provider()
 
                 if not isinstance(message, str) or not message.strip():
                     raise ValueError("Daily report is empty")
 
+                stage = "telegram_send"
                 success, response = self.sender(message)
 
                 if not success:
-                    # Keep SENDING: a network failure may have happened
-                    # after Telegram accepted the message.
-                    self._record_error(
+                    self._record_failure(
                         report_date,
-                        response or "Telegram send result uncertain",
+                        stage,
+                        response or "Telegram send failed",
+                        exception_type="TelegramSendError",
                     )
                     return False
 
+                stage = "mark_sent"
                 self._mark_sent(report_date)
                 return True
 
             except Exception as error:
-                logger.exception("Daily report scheduler failed")
+                logger.exception(
+                    "Daily report scheduler failed at stage %s",
+                    stage,
+                )
 
                 try:
-                    self._record_error(report_date, error)
+                    self._record_failure(
+                        report_date,
+                        stage,
+                        error,
+                    )
                 except Exception:
-                    logger.exception("Could not persist report error")
+                    logger.exception(
+                        "Could not save scheduler failure to SQLite"
+                    )
 
-                # Do not clear SENDING automatically. This avoids
-                # accidental duplicate delivery after an uncertain send.
                 return False
 
     def start(self):
@@ -209,13 +224,18 @@ class DailyReportScheduler:
 
     def _run(self):
         logger.info(
-            "Daily report scheduler running at %02d:%02d IST",
+            "Daily report scheduler started at %02d:%02d IST",
             REPORT_HOUR,
             REPORT_MINUTE,
         )
 
         while not self._stop_event.is_set():
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception:
+                # Last-resort protection: keep the worker alive.
+                logger.exception("Unexpected scheduler loop failure")
+
             self._stop_event.wait(self.poll_interval)
 
     def stop(self, timeout=5):
