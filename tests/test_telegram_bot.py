@@ -1,3 +1,4 @@
+
 import pytest
 
 from pruthvi_ai import telegram_bot
@@ -86,9 +87,15 @@ def test_report_without_provider(telegram_config, monkeypatch):
         "_send_reply",
         lambda message: (sent.append(message) or True, "OK")
     )
+    monkeypatch.setattr(
+        telegram_bot,
+        "_get_daily_report",
+        lambda: "PRUTHVI AI DAILY REPORT — PAPER ONLY"
+    )
 
     assert telegram_bot.handle_update(make_update("/report")) is True
-    assert "not connected yet" in sent[0]
+    assert "PRUTHVI AI DAILY REPORT" in sent[0]
+    assert "PAPER ONLY" in sent[0]
 
 
 def test_unknown_command(telegram_config, monkeypatch):
