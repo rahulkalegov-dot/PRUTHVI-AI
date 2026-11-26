@@ -1,14 +1,14 @@
 
-"""Scheduled daily Telegram reports for PRUTHVI AI.
+"""Persistent duplicate-safe daily Telegram report scheduler.
 
-Informational reporting only. No broker orders or trade execution.
-Runs on weekdays at 15:35 Asia/Kolkata.
+Paper-trading reporting only. No broker orders or trade execution.
+Weekdays at 15:35 Asia/Kolkata.
 """
 
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .daily_report_service import (
@@ -26,34 +26,7 @@ REPORT_MINUTE = 35
 logger = logging.getLogger(__name__)
 
 
-def _next_report_time(now=None):
-    """Return the next weekday report time in IST."""
-    current = now or datetime.now(IST)
-
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=IST)
-    else:
-        current = current.astimezone(IST)
-
-    candidate = current.replace(
-        hour=REPORT_HOUR,
-        minute=REPORT_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-
-    if current >= candidate:
-        candidate += timedelta(days=1)
-
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-
-    return candidate
-
-
 class DailyReportScheduler:
-    """Thread-safe weekday scheduler for daily Telegram reports."""
-
     def __init__(
         self,
         report_provider=None,
@@ -61,9 +34,7 @@ class DailyReportScheduler:
         db_path=None,
         poll_interval=20,
     ):
-        self.report_provider = (
-            report_provider or self._generate_report
-        )
+        self.report_provider = report_provider or self._generate_report
         self.sender = sender or send_telegram_report
         self.db_path = db_path
         self.poll_interval = max(1, int(poll_interval))
@@ -71,10 +42,26 @@ class DailyReportScheduler:
         self._stop_event = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
-        self._last_attempted_date = None
+
+        self._initialize_delivery_table()
 
     def _database(self):
         return PRUTHVIDatabase(self.db_path)
+
+    def _initialize_delivery_table(self):
+        """Create a persistent table with one row per report date."""
+        db = self._database()
+
+        with db.connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_report_deliveries (
+                    report_date TEXT PRIMARY KEY,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('SENDING', 'SENT')),
+                    attempted_at TEXT NOT NULL,
+                    sent_at TEXT
+                )
+            """)
 
     def _generate_report(self):
         report = generate_sqlite_daily_report(
@@ -82,37 +69,74 @@ class DailyReportScheduler:
         )
         return format_sqlite_daily_report(report)
 
-    def _already_sent(self, report_date):
+    def _claim_report_date(self, report_date):
+        """Atomically claim a date so another worker cannot send it."""
         db = self._database()
+        date_key = report_date.isoformat()
 
         with db.connect() as conn:
-            row = conn.execute(
-                """
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Respect successful reports recorded by the older scheduler.
+            old_record = conn.execute("""
                 SELECT 1
                 FROM audit_logs
                 WHERE event_type = 'DAILY_REPORT_SENT'
                   AND json_extract(details, '$.report_date') = ?
                 LIMIT 1
-                """,
-                (report_date.isoformat(),),
-            ).fetchone()
+            """, (date_key,)).fetchone()
 
-        return row is not None
+            if old_record:
+                return False
 
-    def _record_event(self, event_type, message, report_date, details=None):
+            inserted = conn.execute("""
+                INSERT OR IGNORE INTO daily_report_deliveries
+                    (report_date, status, attempted_at)
+                VALUES (?, 'SENDING', ?)
+            """, (date_key, datetime.now(IST).isoformat()))
+
+            if inserted.rowcount == 1:
+                return True
+
+            existing = conn.execute("""
+                SELECT status
+                FROM daily_report_deliveries
+                WHERE report_date = ?
+            """, (date_key,)).fetchone()
+
+            # SENT and SENDING both block another automatic send.
+            return False
+
+    def _mark_sent(self, report_date):
         db = self._database()
 
-        payload = {
-            "report_date": report_date.isoformat(),
-        }
+        with db.connect() as conn:
+            conn.execute("""
+                UPDATE daily_report_deliveries
+                SET status = 'SENT',
+                    sent_at = ?
+                WHERE report_date = ?
+                  AND status = 'SENDING'
+            """, (
+                datetime.now(IST).isoformat(),
+                report_date.isoformat(),
+            ))
 
-        if details:
-            payload.update(details)
+        db.log_event(
+            "DAILY_REPORT_SENT",
+            "Scheduled daily Telegram report sent.",
+            {"report_date": report_date.isoformat()},
+        )
 
-        db.log_event(event_type, message, payload)
+    def _record_error(self, report_date, error):
+        self._database().log_event(
+            "DAILY_REPORT_ERROR",
+            str(error),
+            {"report_date": report_date.isoformat()},
+        )
 
     def run_once(self, now=None):
-        """Send today's report when due; return True only on success."""
+        """Send today's report once after the scheduled time."""
         current = now or datetime.now(IST)
 
         if current.tzinfo is None:
@@ -136,12 +160,8 @@ class DailyReportScheduler:
         report_date = current.date()
 
         with self._lock:
-            if self._last_attempted_date == report_date:
-                return False
-
             try:
-                if self._already_sent(report_date):
-                    self._last_attempted_date = report_date
+                if not self._claim_report_date(report_date):
                     return False
 
                 message = self.report_provider()
@@ -152,43 +172,34 @@ class DailyReportScheduler:
                 success, response = self.sender(message)
 
                 if not success:
-                    raise RuntimeError(
-                        str(response or "Telegram send failed")
+                    # Keep SENDING: a network failure may have happened
+                    # after Telegram accepted the message.
+                    self._record_error(
+                        report_date,
+                        response or "Telegram send result uncertain",
                     )
+                    return False
 
-                self._record_event(
-                    "DAILY_REPORT_SENT",
-                    "Scheduled daily Telegram report sent.",
-                    report_date,
-                )
-
-                self._last_attempted_date = report_date
+                self._mark_sent(report_date)
                 return True
 
             except Exception as error:
                 logger.exception("Daily report scheduler failed")
 
                 try:
-                    self._record_event(
-                        "DAILY_REPORT_ERROR",
-                        str(error),
-                        report_date,
-                    )
+                    self._record_error(report_date, error)
                 except Exception:
-                    logger.exception(
-                        "Could not persist scheduler error"
-                    )
+                    logger.exception("Could not persist report error")
 
-                # Permit retry on the next scheduler poll.
+                # Do not clear SENDING automatically. This avoids
+                # accidental duplicate delivery after an uncertain send.
                 return False
 
     def start(self):
-        """Start the scheduler in a daemon thread."""
         if self._thread and self._thread.is_alive():
             return
 
         self._stop_event.clear()
-
         self._thread = threading.Thread(
             target=self._run,
             name="pruthvi-daily-report-scheduler",
@@ -198,8 +209,7 @@ class DailyReportScheduler:
 
     def _run(self):
         logger.info(
-            "Daily Telegram report scheduler started: "
-            "weekdays at %02d:%02d IST",
+            "Daily report scheduler running at %02d:%02d IST",
             REPORT_HOUR,
             REPORT_MINUTE,
         )
@@ -209,7 +219,6 @@ class DailyReportScheduler:
             self._stop_event.wait(self.poll_interval)
 
     def stop(self, timeout=5):
-        """Stop the scheduler gracefully."""
         self._stop_event.set()
 
         if self._thread and self._thread.is_alive():
@@ -217,7 +226,6 @@ class DailyReportScheduler:
 
 
 def run_daily_report_scheduler():
-    """Run the scheduler as a standalone process."""
     scheduler = DailyReportScheduler()
     scheduler.start()
 
