@@ -1,5 +1,5 @@
 
-"""PRUTHVI AI Telegram command handler.
+""PRUTHVI AI Telegram command handler.
 
 Supports /start, /status, /report and /help.
 Paper-trading monitoring only. No order execution.
