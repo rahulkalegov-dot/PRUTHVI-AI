@@ -1,4 +1,7 @@
+
+"""Conservative decision gate. A BUY/SELL decision is not an order."""
 from dataclasses import dataclass
+from math import isfinite
 
 
 @dataclass
@@ -15,36 +18,51 @@ def make_decision(
     strategy_score,
     news_verified,
     market_trend,
-    risk_approved
+    risk_approved,
+    database=None,
 ):
-    if not symbol or not risk_approved:
-        return Decision(
-            symbol, "NO TRADE", 0,
-            "Risk approval missing"
+    normalized = (
+        str(symbol).strip().upper()
+        if isinstance(symbol, str) else ""
+    )
+
+    def result(action, score, reason):
+        decision = Decision(
+            normalized, action, score, reason
         )
+
+        if database is not None and normalized:
+            database.save_decision(
+                normalized, action, score, reason
+            )
+
+        return decision
+
+    if not normalized:
+        return result("NO TRADE", 0.0, "Invalid symbol")
+
+    if not risk_approved:
+        return result("NO TRADE", 0.0, "Risk approval missing")
 
     if not news_verified:
-        return Decision(
-            symbol, "NO TRADE", 0,
-            "News verification missing"
-        )
+        return result("NO TRADE", 0.0, "News verification missing")
 
     if market_trend not in ("BULLISH", "BEARISH"):
-        return Decision(
-            symbol, "NO TRADE", 0,
-            "Market trend uncertain"
-        )
+        return result("NO TRADE", 0.0, "Market trend uncertain")
 
-    if not -1 <= technical_score <= 1:
-        raise ValueError("Invalid technical score")
+    try:
+        technical_score = float(technical_score)
+        strategy_score = float(strategy_score)
+    except (TypeError, ValueError):
+        return result("NO TRADE", 0.0, "Invalid score data")
 
-    if not -1 <= strategy_score <= 1:
-        raise ValueError("Invalid strategy score")
+    if not isfinite(technical_score) or not isfinite(strategy_score):
+        return result("NO TRADE", 0.0, "Non-finite score data")
 
-    score = (
-        technical_score * 0.6
-        + strategy_score * 0.4
-    )
+    if not -1 <= technical_score <= 1 or not -1 <= strategy_score <= 1:
+        return result("NO TRADE", 0.0, "Scores must be between -1 and 1")
+
+    score = technical_score * 0.6 + strategy_score * 0.4
 
     if market_trend == "BULLISH" and score >= 0.7:
         action = "BUY"
@@ -53,11 +71,8 @@ def make_decision(
     else:
         action = "NO TRADE"
 
-    return Decision(
-        symbol,
+    return result(
         action,
         round(score, 3),
-        f"Technical={technical_score}, "
-        f"Strategy={strategy_score}, "
-        f"Market={market_trend}"
+        f"Technical={technical_score}, Strategy={strategy_score}, Market={market_trend}",
     )
