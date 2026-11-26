@@ -3,7 +3,7 @@
 
 Reports are informational only. This module never places broker orders.
 """
-import sqlite3
+
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -19,18 +19,20 @@ def _day_bounds(report_date=None):
     start_ist = datetime.combine(day, time.min, tzinfo=IST)
     end_ist = start_ist + timedelta(days=1)
 
-    return start_ist.astimezone(timezone.utc).isoformat(), (
-        end_ist.astimezone(timezone.utc).isoformat()
+    return (
+        start_ist.astimezone(timezone.utc).isoformat(),
+        end_ist.astimezone(timezone.utc).isoformat(),
     )
 
 
 def generate_sqlite_daily_report(db_path=None, report_date=None):
     """Generate a daily report from persisted SQLite records."""
     db = PRUTHVIDatabase(db_path)
-    start_utc, end_utc = _day_bounds(report_date)
+    selected_date = report_date or datetime.now(IST).date()
+    start_utc, end_utc = _day_bounds(selected_date)
 
     report = {
-        "date": (report_date or datetime.now(IST).date()).isoformat(),
+        "date": selected_date.isoformat(),
         "mode": "PAPER ONLY",
         "scans": [],
         "decisions": [],
@@ -142,9 +144,37 @@ def generate_sqlite_daily_report(db_path=None, report_date=None):
     return report
 
 
+def _format_trade_details(trade):
+    """Format one persisted paper trade without estimating live prices."""
+    lines = [
+        f"{trade['symbol']} | {trade['side']} | "
+        f"Quantity: {trade['quantity']}",
+        f"Entry: {float(trade['entry_price']):.2f}",
+        f"Stop-Loss: {float(trade['stop_loss']):.2f}",
+        f"Target: {float(trade['target']):.2f}",
+        f"Status: {trade['status']}",
+    ]
+
+    if trade["status"] == "CLOSED":
+        lines.extend([
+            f"Exit: {float(trade['exit_price']):.2f}",
+            f"Gross P&L: {float(trade['gross_pnl'] or 0):.2f}",
+            f"Net P&L: {float(trade['net_pnl'] or 0):.2f}",
+            f"Exit time: {trade['exit_time']}",
+        ])
+    else:
+        lines.append(
+            "Unrealized P&L: Not calculated "
+            "(verified current market price unavailable)."
+        )
+
+    return "\n".join(lines)
+
+
 def format_sqlite_daily_report(report):
-    """Format the report for Telegram."""
+    """Format the complete daily report for Telegram."""
     summary = report["summary"]
+
     lines = [
         f"PRUTHVI AI DAILY REPORT — {report['date']}",
         f"Mode: {report['mode']}",
@@ -158,11 +188,41 @@ def format_sqlite_daily_report(report):
         f"Risk checks: {summary['risk_checks_count']}",
         f"Risk rejections: {summary['risk_rejections']}",
         "",
-        "PAPER TRADES",
+        "PAPER TRADE SUMMARY",
         f"Closed trades: {summary['closed_trades']}",
         f"Open trades: {summary['open_trades']}",
         f"Gross P&L: {summary['gross_pnl']:.2f}",
         f"Net P&L: {summary['net_pnl']:.2f}",
+        "",
+        "CLOSED / TODAY'S TRADE DETAILS",
+    ]
+
+    if report["trades"]:
+        for trade in report["trades"]:
+            lines.extend([
+                "",
+                _format_trade_details(trade),
+                "--------------------",
+            ])
+    else:
+        lines.append("No trades recorded for this date.")
+
+    lines.extend([
+        "",
+        "ALL CURRENT OPEN POSITIONS",
+    ])
+
+    if report["open_trades"]:
+        for trade in report["open_trades"]:
+            lines.extend([
+                "",
+                _format_trade_details(trade),
+                "--------------------",
+            ])
+    else:
+        lines.append("No open paper positions.")
+
+    lines.extend([
         "",
         "SYSTEM HEALTH",
         f"Database: {report['health']['database']}",
@@ -175,7 +235,7 @@ def format_sqlite_daily_report(report):
         report["square_off_verification"],
         "",
         "RECENT DECISIONS",
-    ]
+    ])
 
     for item in report["decisions"][:15]:
         lines.append(
@@ -190,7 +250,8 @@ def format_sqlite_daily_report(report):
 
     for item in report["scans"][:15]:
         lines.append(
-            f"{item['symbol']}: {item['status']} — {item['reason'] or '-'}"
+            f"{item['symbol']}: {item['status']} — "
+            f"{item['reason'] or '-'}"
         )
 
     if not report["scans"]:
