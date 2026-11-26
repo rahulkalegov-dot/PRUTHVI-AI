@@ -1,20 +1,14 @@
 
-"""Persistent SQLite database for PRUTHVI AI.
-PAPER ONLY. No live order execution.
-"""
-
+"""Persistent SQLite storage for PRUTHVI AI. PAPER ONLY; no broker execution."""
 import json
 import os
 import sqlite3
 import uuid
-
 from datetime import datetime, timezone
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "pruthvi_ai.db"
-
 DATABASE_PATH = Path(
     os.environ.get("PRUTHVI_DB_PATH", str(DEFAULT_DB_PATH))
 )
@@ -25,16 +19,17 @@ def utc_now():
 
 
 class PRUTHVIDatabase:
-
     def __init__(self, db_path=None):
         self.db_path = Path(db_path) if db_path else DATABASE_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
     def connect(self):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def initialize(self):
@@ -77,18 +72,25 @@ class PRUTHVIDatabase:
                 CREATE TABLE IF NOT EXISTS paper_trades (
                     trade_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    entry_price REAL NOT NULL,
-                    stop_loss REAL,
-                    target REAL,
+                    side TEXT NOT NULL CHECK(side IN ('BUY', 'SELL')),
+                    quantity INTEGER NOT NULL CHECK(quantity > 0),
+                    entry_price REAL NOT NULL CHECK(entry_price > 0),
+                    stop_loss REAL NOT NULL,
+                    target REAL NOT NULL,
                     entry_time TEXT NOT NULL,
                     exit_price REAL,
                     exit_time TEXT,
                     gross_pnl REAL,
                     net_pnl REAL,
                     status TEXT NOT NULL DEFAULT 'OPEN'
+                        CHECK(status IN ('OPEN', 'CLOSED'))
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_paper_trades_status
+                    ON paper_trades(status);
+
+                CREATE INDEX IF NOT EXISTS idx_scans_timestamp
+                    ON scans(timestamp);
             """)
 
         self.log_event(
@@ -100,8 +102,8 @@ class PRUTHVIDatabase:
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO audit_logs
-                (timestamp, event_type, message, details)
-                VALUES (?, ?, ?, ?)""",
+                   (timestamp, event_type, message, details)
+                   VALUES (?, ?, ?, ?)""",
                 (
                     utc_now(),
                     str(event_type),
@@ -111,35 +113,51 @@ class PRUTHVIDatabase:
                 ),
             )
 
+    # Backward-compatible spelling for earlier callers.
+    def log_audit(self, event_type, details=None, message=None):
+        self.log_event(
+            event_type,
+            message or str(event_type),
+            details,
+        )
+
     def save_scan(self, symbol, status, reason=""):
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO scans
-                (timestamp, symbol, status, reason)
-                VALUES (?, ?, ?, ?)""",
-                (utc_now(), symbol, status, reason),
+                   (timestamp, symbol, status, reason)
+                   VALUES (?, ?, ?, ?)""",
+                (utc_now(), str(symbol), str(status), str(reason)),
             )
 
     def save_decision(self, symbol, action, score=None, reasoning=""):
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO decisions
-                (timestamp, symbol, action, score, reasoning)
-                VALUES (?, ?, ?, ?, ?)""",
-                (utc_now(), symbol, action, score, reasoning),
+                   (timestamp, symbol, action, score, reasoning)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    utc_now(),
+                    str(symbol),
+                    str(action),
+                    score,
+                    str(reasoning),
+                ),
             )
 
-    def save_risk_check(self, symbol, approved, reason="", details=None):
+    def save_risk_check(
+        self, symbol, approved, reason="", details=None
+    ):
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO risk_checks
-                (timestamp, symbol, approved, reason, details)
-                VALUES (?, ?, ?, ?, ?)""",
+                   (timestamp, symbol, approved, reason, details)
+                   VALUES (?, ?, ?, ?, ?)""",
                 (
                     utc_now(),
-                    symbol,
+                    str(symbol),
                     int(bool(approved)),
-                    reason,
+                    str(reason),
                     json.dumps(details, default=str)
                     if details is not None else None,
                 ),
@@ -155,31 +173,50 @@ class PRUTHVIDatabase:
         target,
         entry_time=None,
     ):
-        if side not in ("BUY", "SELL"):
-            raise ValueError("Side must be BUY or SELL")
+        if not symbol or side not in ("BUY", "SELL"):
+            raise ValueError("Invalid symbol or side")
 
-        if quantity <= 0 or entry_price <= 0:
-            raise ValueError("Invalid quantity or entry price")
+        if (
+            isinstance(quantity, bool)
+            or int(quantity) != quantity
+            or quantity <= 0
+        ):
+            raise ValueError("Quantity must be a positive integer")
 
-        if stop_loss is None or target is None:
-            raise ValueError("Stop-loss and target are required")
+        values = (entry_price, stop_loss, target)
+
+        if any(
+            not isinstance(v, (int, float))
+            or not __import__("math").isfinite(v)
+            for v in values
+        ):
+            raise ValueError("Trade prices must be finite numbers")
+
+        if entry_price <= 0 or stop_loss <= 0 or target <= 0:
+            raise ValueError("Trade prices must be positive")
+
+        if side == "BUY" and not stop_loss < entry_price < target:
+            raise ValueError("Invalid BUY stop-loss/target")
+
+        if side == "SELL" and not target < entry_price < stop_loss:
+            raise ValueError("Invalid SELL stop-loss/target")
 
         trade_id = str(uuid.uuid4())
 
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO paper_trades
-                (trade_id, symbol, side, quantity, entry_price,
-                 stop_loss, target, entry_time, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+                   (trade_id, symbol, side, quantity, entry_price,
+                    stop_loss, target, entry_time, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
                 (
                     trade_id,
-                    symbol,
+                    str(symbol),
                     side,
-                    quantity,
-                    entry_price,
-                    stop_loss,
-                    target,
+                    int(quantity),
+                    float(entry_price),
+                    float(stop_loss),
+                    float(target),
                     entry_time or utc_now(),
                 ),
             )
@@ -193,71 +230,105 @@ class PRUTHVIDatabase:
         return trade_id
 
     def record_trade_close(
-        self,
-        trade_id,
-        exit_price,
-        gross_pnl,
-        net_pnl=None,
+        self, trade_id, exit_price, gross_pnl, net_pnl=None
     ):
-        if exit_price <= 0:
+        import math
+
+        if not all(
+            math.isfinite(float(v))
+            for v in (
+                exit_price,
+                gross_pnl,
+                gross_pnl if net_pnl is None else net_pnl,
+            )
+        ):
+            raise ValueError("Exit and P&L values must be finite")
+
+        if float(exit_price) <= 0:
             raise ValueError("Invalid exit price")
 
         with self.connect() as conn:
-            cursor = conn.execute(
+            cur = conn.execute(
                 """UPDATE paper_trades
-                SET exit_price = ?,
-                    exit_time = ?,
-                    gross_pnl = ?,
-                    net_pnl = ?,
-                    status = 'CLOSED'
-                WHERE trade_id = ? AND status = 'OPEN'""",
+                   SET exit_price = ?,
+                       exit_time = ?,
+                       gross_pnl = ?,
+                       net_pnl = ?,
+                       status = 'CLOSED'
+                   WHERE trade_id = ? AND status = 'OPEN'""",
                 (
-                    exit_price,
+                    float(exit_price),
                     utc_now(),
-                    gross_pnl,
-                    gross_pnl if net_pnl is None else net_pnl,
-                    trade_id,
+                    float(gross_pnl),
+                    float(gross_pnl if net_pnl is None else net_pnl),
+                    str(trade_id),
                 ),
             )
 
-            if cursor.rowcount != 1:
-                raise ValueError("Trade not found or already closed")
+            if cur.rowcount != 1:
+                raise ValueError(
+                    "Trade not found or already closed"
+                )
 
         self.log_event(
             "PAPER_TRADE_CLOSED",
             "Virtual trade closed",
-            {"trade_id": trade_id, "exit_price": exit_price},
+            {
+                "trade_id": trade_id,
+                "exit_price": exit_price,
+            },
         )
 
     def get_open_trades(self):
         with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM paper_trades WHERE status = 'OPEN'"
-            ).fetchall()
-            return [dict(row) for row in rows]
+            return [
+                dict(row)
+                for row in conn.execute(
+                    """SELECT * FROM paper_trades
+                       WHERE status = 'OPEN'
+                       ORDER BY entry_time"""
+                ).fetchall()
+            ]
 
     def get_trade_history(self):
         with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM paper_trades ORDER BY entry_time"
-            ).fetchall()
-            return [dict(row) for row in rows]
+            return [
+                dict(row)
+                for row in conn.execute(
+                    """SELECT * FROM paper_trades
+                       ORDER BY entry_time"""
+                ).fetchall()
+            ]
 
     def get_recent_logs(self, limit=100):
+        if isinstance(limit, bool) or int(limit) <= 0:
+            raise ValueError("Limit must be a positive integer")
+
         with self.connect() as conn:
-            rows = conn.execute(
-                """SELECT * FROM audit_logs
-                ORDER BY id DESC LIMIT ?""",
-                (limit,),
-            ).fetchall()
-            return [dict(row) for row in rows]
+            return [
+                dict(row)
+                for row in conn.execute(
+                    """SELECT * FROM audit_logs
+                       ORDER BY id DESC LIMIT ?""",
+                    (int(limit),),
+                ).fetchall()
+            ]
 
     def health_check(self):
-        with self.connect() as conn:
-            conn.execute("SELECT 1").fetchone()
+        try:
+            with self.connect() as conn:
+                conn.execute("SELECT 1").fetchone()
 
-        return {
-            "database": "OK",
-            "paper_only": True,
-            "path": str(self.db_path),
-        }
+            return {
+                "database": "OK",
+                "engine": "SQLite",
+                "paper_only": True,
+            }
+
+        except sqlite3.Error:
+            return {
+                "database": "ERROR",
+                "engine": "SQLite",
+                "paper_only": True,
+            }
+
